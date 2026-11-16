@@ -1,0 +1,11 @@
+# SimpleAV runtime data (never commit: logs and quarantine contain paths from your PC)
+logs/
+quarantine/
+*.quarantined
+*.quarantined.txt
+progress.json
+settings.json
+selfhash.txt
+known_unsigned_system_files.txt
+history.csv
+*.log
