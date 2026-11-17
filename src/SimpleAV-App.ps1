@@ -15,16 +15,16 @@ $ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-$Version  = '1.2'
-$Dir      = if ($env:SIMPLEAV_HOME) { $env:SIMPLEAV_HOME } else { Join-Path $env:USERPROFILE 'SimpleAV' }
+. (Join-Path $PSScriptRoot 'SimpleAV.Detection.ps1')   # shared detection core + version number
+$Version  = $SAV_Version
+$Dir     = if ($env:SIMPLEAV_HOME) { $env:SIMPLEAV_HOME } else { Join-Path $env:USERPROFILE 'SimpleAV' }
 $Engine   = Join-Path $Dir 'SimpleAV.ps1'
 if (-not (Test-Path $Engine)) { $Engine = Join-Path $PSScriptRoot 'SimpleAV.ps1' }   # running straight from the repo
 $LogDir   = Join-Path $Dir 'logs'
 $ProgFile = Join-Path $Dir 'progress.json'
 $HistFile = Join-Path $Dir 'history.csv'      # optional record of a manual cleanup (see docs/HOW-IT-WORKS.md)
 $SettingsFile = Join-Path $Dir 'settings.json'
-$QDirs    = @((Join-Path $Dir 'quarantine'), "$env:ProgramData\SimpleAV-Quarantine")
-$QDir     = $QDirs[0]
+$QDir     = Join-Path $Dir 'quarantine'
 $PS       = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $TestPathRx = '\\SimpleAV-test'               # samples created by tests\Run-Tests.ps1
 
@@ -34,6 +34,8 @@ $script:Tick = 0
 $script:Anim = 0
 $script:Model = $null
 $script:RowsKey = ''
+$script:Busy = $false        # true while a dialog is open: the refresh timer must not re-enter
+$script:InfCache = @{}       # path -> @{ Stamp; Result } so unchanged files aren't re-read every refresh
 
 # Start menu entry (created from here because this window runs as a normal app)
 $startLnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\SimpleAV.lnk'
@@ -77,7 +79,11 @@ function Get-EngineProcs([string]$flag) {
 function Get-Progress { if (Test-Path $ProgFile) { try { return (Get-Content $ProgFile -Raw | ConvertFrom-Json) } catch {} }; return $null }
 function Test-ScanRunning {
   $p = Get-Progress
-  if ($p -and $p.state -eq 'running' -and (Get-Process -Id $p.pid -ErrorAction SilentlyContinue)) { return $true }
+  if ($p -and $p.state -eq 'running') {
+    $proc = Get-Process -Id $p.pid -ErrorAction SilentlyContinue
+    # The process must have started before the scan did - otherwise a crashed scan's PID was reused.
+    if ($proc -and (-not $p.started -or $proc.StartTime -le ([datetime]$p.started).AddSeconds(5))) { return $true }
+  }
   return (((Get-Date) - $script:Launched).TotalSeconds -lt 15)
 }
 function Get-LastScan {
@@ -88,7 +94,8 @@ function Get-LastScan {
     $o = [ordered]@{ File = $logFile.FullName; Time = $logFile.LastWriteTime; Mode = 'Full (C:)'; Min = 0; Files = 0; High = 0; Med = 0; Low = 0; Opened = $null; Skipped = $null; Unreadable = $null }
     $ts = [regex]::Match($done.Line, '^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\]'); if ($ts.Success) { $o.Time = [datetime]::ParseExact($ts.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', $null) }
     $m = Select-String -LiteralPath $logFile.FullName -Pattern '\] Mode: (.+)$' | Select-Object -First 1; if ($m) { $o.Mode = $m.Matches[0].Groups[1].Value.Trim() }
-    $mm = [regex]::Match($done.Line, 'DONE in ([\d,\.]+) min\. Program files checked: ([\d,\.]+).*HIGH=(\d+) MEDIUM=(\d+) LOW=(\d+)')
+    # Number groups may hold culture separators from logs written before 1.3 (fr-FR: "54 509"); keep digits only.
+    $mm = [regex]::Match($done.Line, 'DONE in ([^a-z]+?) min\. Program files checked: ([^(]+?) \(.*HIGH=(\d+) MEDIUM=(\d+) LOW=(\d+)')
     if ($mm.Success) { $o.Min = [int]($mm.Groups[1].Value -replace '[^\d]', ''); $o.Files = [int64]($mm.Groups[2].Value -replace '[^\d]', ''); $o.High = [int]$mm.Groups[3].Value; $o.Med = [int]$mm.Groups[4].Value; $o.Low = [int]$mm.Groups[5].Value }
     $cv = Select-String -LiteralPath $logFile.FullName -Pattern 'COVERAGE: files opened=(\d+) \| programs=(\d+) \| folders skipped=(\d+) \| files unreadable=(\d+)' | Select-Object -Last 1
     if ($cv) { $g = $cv.Matches[0].Groups; $o.Opened = [int64]$g[1].Value; $o.Skipped = [int]$g[3].Value; $o.Unreadable = [int]$g[4].Value }
@@ -99,68 +106,81 @@ function Get-LastScan {
 # original path (lower-case) -> quarantined file
 function Get-QuarantineMap {
   $map = @{}
-  foreach ($qd in $QDirs) {
-    Get-ChildItem $qd -Filter '*.quarantined.txt' -Force | ForEach-Object {
-      $orig = (Get-Content $_.FullName | Where-Object { $_ -like 'Original path:*' } | Select-Object -First 1) -replace '^Original path:\s*', ''
-      $qf = $_.FullName -replace '\.txt$', ''
-      if ($orig -and (Test-Path -LiteralPath $qf)) { $map[$orig.ToLowerInvariant()] = $qf }
-    }
+  Get-ChildItem $QDir -Filter '*.quarantined.txt' -Force | ForEach-Object {
+    $orig = (Get-Content $_.FullName | Where-Object { $_ -like 'Original path:*' } | Select-Object -First 1) -replace '^Original path:\s*', ''
+    $qf = $_.FullName -replace '\.txt$', ''
+    if ($orig -and $orig -notmatch $TestPathRx -and (Test-Path -LiteralPath $qf)) { $map[$orig.ToLowerInvariant()] = $qf }   # test samples don't count
   }
   return $map
 }
 function Get-AutoQuarantine { if (Test-Path $SettingsFile) { try { $j = Get-Content $SettingsFile -Raw | ConvertFrom-Json; if ($null -ne $j.AutoQuarantine) { return [bool]$j.AutoQuarantine } } catch {} }; return $true }
 function Test-ScanLogIsTest([string]$csv) { return (Select-String -LiteralPath ($csv -replace '\.csv$', '.log') -Pattern '\] Mode: Custom' -Quiet) }
-# Same infection test as the scanner: is this file STILL infected (vs. a clean reinstalled copy)?
-$KnownStub = [byte[]](0xE8,0xD9,0x00,0x00,0x00,0x48,0x8D,0x58,0xFB,0x51,0x52,0x41)
+# Same infection test as the scanner (shared code): is this file STILL infected, or a clean reinstalled copy?
+# Returns $true / $false, or $null when the file can't be read (shown as "Check details", not as a threat).
 function Test-StillInfected([string]$path) {
-  $fs = $null
-  try {
-    $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite, Delete'); $buf = New-Object byte[] 4096; $n = $fs.Read($buf, 0, 4096)
-    if ($n -lt 64 -or $buf[0] -ne 0x4D -or $buf[1] -ne 0x5A) { return $false }
-    $pe = [BitConverter]::ToInt32($buf, 0x3C); if ($pe -lt 0 -or ($pe + 64) -gt $n -or [BitConverter]::ToUInt32($buf, $pe) -ne 17744) { return $false }
-    $nsec = [BitConverter]::ToUInt16($buf, $pe + 6); $optsz = [BitConverter]::ToUInt16($buf, $pe + 20); $ep = [int64][BitConverter]::ToUInt32($buf, $pe + 40); $so = $pe + 24 + $optsz
-    if ($nsec -eq 0 -or ($so + $nsec * 40) -gt $n) { return $false }
-    for ($i = 0; $i -lt $nsec; $i++) {
-      $b = $so + $i * 40; $vs = [int64][BitConverter]::ToUInt32($buf, $b + 8); $va = [int64][BitConverter]::ToUInt32($buf, $b + 12); $rs = [int64][BitConverter]::ToUInt32($buf, $b + 16); $rp = [int64][BitConverter]::ToUInt32($buf, $b + 20); $ch = [int64][BitConverter]::ToUInt32($buf, $b + 36)
-      if ($ep -ge $va -and $ep -lt ($va + [Math]::Max($vs, $rs))) {
-        $off = $rp + ($ep - $va); $stub = New-Object byte[] 12
-        if ($off -ge 0 -and ($off + 12) -le $fs.Length) { $null = $fs.Seek($off, 'Begin'); $null = $fs.Read($stub, 0, 12) }
-        $same = $true; for ($k = 0; $k -lt 12; $k++) { if ($stub[$k] -ne $KnownStub[$k]) { $same = $false; break } }
-        $name = [Text.Encoding]::ASCII.GetString($buf, $b, 8).TrimEnd([char]0)
-        return ($same -or ($i -eq ($nsec - 1) -and (@('.reloc', '.rsrc', '.data', '.pdata', '.idata', '.tls', '.rdata') -contains $name) -and (($ch -band 3758096384) -eq 3758096384)))
-      }
-    }
-    return $false
-  } catch { return $true } finally { if ($fs) { $fs.Dispose() } }   # unreadable = assume the worst
+  $stamp = ''
+  try { $fi = New-Object System.IO.FileInfo $path; $stamp = '{0}|{1}' -f $fi.Length, $fi.LastWriteTimeUtc.Ticks } catch {}
+  $c = $script:InfCache[$path]
+  if ($c -and $stamp -and $c.Stamp -eq $stamp) { return $c.Result }
+  $v = Get-PEVerdict $path
+  $res = if ($v.Unreadable) { $null } else { [bool]$v.Reason }
+  if ($stamp -and -not $v.Unreadable) { $script:InfCache[$path] = @{ Stamp = $stamp; Result = $res } }
+  return $res
 }
 $InfectedKinds = 'INFECTED FILE', 'INFECTED FILE APPEARED', 'INFECTED PROGRAM RUNNING', 'AUTO-QUARANTINED', 'Infected'
 
 # Live status of a finding: present / running / quarantined / deleted / removed / replaced / stopped / resolved / unknown
-function Get-ItemStatus([string]$where, [string]$kind, $qmap) {
+function Get-ItemStatus([string]$where, [string]$kind, $qmap, $when = $null) {
   if ($kind -eq 'SIMPLEAV MODIFIED') {
-    $want = (Get-Content (Join-Path $Dir 'selfhash.txt') -TotalCount 1).Trim(); $have = (Get-FileHash $Engine).Hash
-    if ($want -eq $have) { return 'resolved' } else { return 'present' }
+    # selfhash.txt: "file|SHA256" lines (a bare hash = SimpleAV.ps1, written by 1.2.0)
+    $want = $null
+    foreach ($line in Get-Content (Join-Path $Dir 'selfhash.txt')) {
+      $p = $line.Trim().Split('|')
+      if ($p.Count -eq 2 -and (Join-Path $Dir $p[0]) -ieq $where) { $want = $p[1] } elseif ($p.Count -eq 1 -and $p[0] -and $where -like '*\SimpleAV.ps1') { $want = $p[0] }
+    }
+    if ($want -and (Test-Path -LiteralPath $where) -and (Get-FileHash -LiteralPath $where).Hash -eq $want) { return 'resolved' } else { return 'present' }
   }
   if ($where -match '^[A-Za-z]:\\') {
     if (Test-Path -LiteralPath $where) {
-      if ($InfectedKinds -contains $kind -and -not (Test-StillInfected $where)) { return 'replaced' }
+      if ($InfectedKinds -contains $kind) {
+        $si = Test-StillInfected $where
+        if ($null -eq $si) { return 'unknown' }
+        if (-not $si) { return 'replaced' }
+      }
       return 'present'
     }
     if ($qmap.ContainsKey($where.ToLowerInvariant())) { return 'quarantined' }
     return 'deleted'
   }
-  $parts = $where.Split('|')
+  $parts = $where.Split('|', 3)          # registry value names may themselves contain '|'
+  $rest  = if ($parts.Count -gt 1) { $where.Substring($parts[0].Length + 1) } else { '' }
   switch ($parts[0]) {
-    'WINLOGON' { $v = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon').Shell; if ($v) { return 'present' } else { return 'removed' } }
-    'ENV'      { if ((Get-Item 'HKCU:\Environment').Property -contains $parts[1]) { return 'present' } else { return 'removed' } }
-    'CLSID'    { if (Test-Path "HKCU:\Software\Classes\CLSID\$($parts[1])") { return 'present' } else { return 'removed' } }
+    'WINLOGON' {   # same rules as the engine's Test-PersistenceItem
+      $hive = if ($parts[1] -eq 'HKLM') { 'HKLM:\SOFTWARE' } else { 'HKCU:\Software' }
+      $v = [string](Get-ItemProperty "$hive\Microsoft\Windows NT\CurrentVersion\Winlogon").($parts[2])
+      $bad = switch ($parts[2]) {
+        'Shell'    { if ($parts[1] -eq 'HKCU') { [bool]$v } else { $v -and $v.Trim() -ne 'explorer.exe' } }
+        'Userinit' { $v -and $v.Trim().TrimEnd(',') -ine "$env:SystemRoot\system32\userinit.exe" }
+        default    { $false }
+      }
+      if ($bad) { return 'present' } else { return 'removed' }
+    }
+    'ENV'      { if ((Get-Item 'HKCU:\Environment').Property -contains $rest) { return 'present' } else { return 'removed' } }
+    'CLSID'    { if (Test-Path "HKCU:\Software\Classes\CLSID\$rest") { return 'present' } else { return 'removed' } }
     'RUN'      { if ((Get-Item $parts[1]).Property -contains $parts[2]) { return 'present' } else { return 'removed' } }
-    'IFEO'     { foreach ($r in 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options') { if ((Get-ItemProperty "$r\$($parts[1])").Debugger) { return 'present' } }; return 'removed' }
-    'TASK'     { $p = $parts[1]; $n = Split-Path $p -Leaf; if (Get-ScheduledTask -TaskName $n) { return 'present' } else { return 'removed' } }
-    'STARTUP'  { if (Test-Path -LiteralPath $parts[1]) { return 'present' } else { return 'removed' } }
+    'IFEO'     { foreach ($r in 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options') { if ((Get-ItemProperty "$r\$rest").Debugger) { return 'present' } }; return 'removed' }
+    'TASK'     {   # match the folder too, not just the name
+      $tp = $rest.Substring(0, $rest.LastIndexOf('\') + 1); $tn = $rest.Substring($rest.LastIndexOf('\') + 1)
+      if (Get-ScheduledTask -TaskPath $tp -TaskName $tn) { return 'present' } else { return 'removed' }
+    }
+    'STARTUP'  { if (Test-Path -LiteralPath $rest) { return 'present' } else { return 'removed' } }
   }
   $pm = [regex]::Match($where, '\[(\d+)\]$')
-  if ($pm.Success) { if (Get-Process -Id ([int]$pm.Groups[1].Value)) { return 'running' } else { return 'stopped' } }
+  if ($pm.Success) {
+    # Process IDs get reused: only "running" if that process already existed when the alert was raised.
+    $gp = Get-Process -Id ([int]$pm.Groups[1].Value)
+    if ($gp -and (-not $when -or $gp.StartTime -le ([datetime]$when).AddSeconds(30))) { return 'running' } else { return 'stopped' }
+  }
   return 'unknown'
 }
 function Get-FriendlyKind([string]$k) {
@@ -206,7 +226,7 @@ function Get-Model {
     $left = 0; $clean = 0
     foreach ($h in $g.Group) {
       $seen[$h.Where.ToLowerInvariant()] = 1
-      if (Test-Path -LiteralPath $h.Where) { if (Test-StillInfected $h.Where) { $left++ } else { $clean++ } }
+      if (Test-Path -LiteralPath $h.Where) { if ((Test-StillInfected $h.Where) -ne $false) { $left++ } else { $clean++ } }
     }
     $deleted += ($g.Count - $left)
     $st = if ($left) { 'present' } elseif ($clean) { 'replaced' } else { 'deleted' }
@@ -232,7 +252,7 @@ function Get-Model {
       $key = ($r.Kind + '|' + $r.Path).ToLowerInvariant()
       if ($seen.ContainsKey($key) -or $seen.ContainsKey($r.Path.ToLowerInvariant())) { continue }
       $seen[$key] = 1
-      $rows.Add([pscustomobject]@{ Title = (Get-FriendlyKind $r.Kind); Where = (Get-FriendlyWhere $r.Path); Status = (Get-ItemStatus $r.Path $r.Kind $qmap); Date = [datetime]$r.Time; Detail = "$(Get-FriendlyKind $r.Kind)`nLocation: $($r.Path)`nWhy: $($r.Detail)`nRisk: $($r.Severity)"; Path = $(if ($r.Path -match '^[A-Za-z]:\\') { $r.Path } else { '' }); Q = $qmap[$r.Path.ToLowerInvariant()] })
+      $rows.Add([pscustomobject]@{ Title = (Get-FriendlyKind $r.Kind); Where = (Get-FriendlyWhere $r.Path); Status = (Get-ItemStatus $r.Path $r.Kind $qmap $r.Time); Date = [datetime]$r.Time; Detail = "$(Get-FriendlyKind $r.Kind)`nLocation: $($r.Path)`nWhy: $($r.Detail)`nRisk: $($r.Severity)"; Path = $(if ($r.Path -match '^[A-Za-z]:\\') { $r.Path } else { '' }); Q = $qmap[$r.Path.ToLowerInvariant()] })
     }
   }
 
@@ -246,7 +266,7 @@ function Get-Model {
       if ($x.Groups[1].Value.StartsWith($today)) { $m.AlertsToday++ }
       if ($sev -ne 'HIGH') { continue }
       $key = ($kind + '|' + $where).ToLowerInvariant(); if ($seen.ContainsKey($key)) { continue }; $seen[$key] = 1
-      $rows.Add([pscustomobject]@{ Title = (Get-FriendlyKind $kind); Where = (Get-FriendlyWhere $where); Status = (Get-ItemStatus $where $kind $qmap); Date = $when; Detail = "Caught live by the watcher.`nLocation: $where`nWhy: $($x.Groups[5].Value)"; Path = $(if ($where -match '^[A-Za-z]:\\') { $where } else { '' }); Q = $qmap[$where.ToLowerInvariant()] })
+      $rows.Add([pscustomobject]@{ Title = (Get-FriendlyKind $kind); Where = (Get-FriendlyWhere $where); Status = (Get-ItemStatus $where $kind $qmap $when); Date = $when; Detail = "Caught live by the watcher.`nLocation: $where`nWhy: $($x.Groups[5].Value)"; Path = $(if ($where -match '^[A-Za-z]:\\') { $where } else { '' }); Q = $qmap[$where.ToLowerInvariant()] })
     }
   }
 
@@ -488,15 +508,24 @@ function Build-Rows($rows) {
   }
   $list.ResumeLayout()
 }
-# Runs the engine for a quarantine/restore action; asks for admin rights only if Windows refuses.
+# Runs the engine for a quarantine/restore action and returns its exit code.
+# Asks for admin rights ONLY on exit 5 (Windows denied access) - never for a bad record or a file in use.
 function Invoke-EngineAction([string]$verb, [string]$target) {
   $argLine = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Engine`" -$verb `"$target`""
   $p = Start-Process $PS -ArgumentList $argLine -WindowStyle Hidden -Wait -PassThru
   if ($p.ExitCode -eq 5) {
-    if ([System.Windows.Forms.MessageBox]::Show("Windows needs administrator permission for this file.`n`nContinue? (Windows will ask you to confirm.)", 'SimpleAV', 'YesNo', 'Question') -ne 'Yes') { return $false }
-    try { $p = Start-Process $PS -ArgumentList $argLine -Verb RunAs -WindowStyle Hidden -Wait -PassThru } catch { return $false }
+    if ([System.Windows.Forms.MessageBox]::Show("Windows needs administrator permission for this file.`n`nContinue? (Windows will ask you to confirm.)", 'SimpleAV', 'YesNo', 'Question') -ne 'Yes') { return -1 }
+    try { $p = Start-Process $PS -ArgumentList $argLine -Verb RunAs -WindowStyle Hidden -Wait -PassThru } catch { return -1 }
   }
-  return ($p.ExitCode -eq 0)
+  return $p.ExitCode
+}
+$ActionErrors = @{
+  2  = 'The file is no longer there.'
+  3  = "SimpleAV refused: the quarantine record is invalid, or the quarantined file doesn't match the fingerprint (SHA-256) taken when it was quarantined."
+  4  = 'A file already exists at the original location (for example a clean reinstall). SimpleAV never overwrites it. Rename or remove that file first if you really want the old one back.'
+  5  = 'Windows denied access, even with administrator rights.'
+  6  = 'The file is in use. Close the program using it (or restart your PC), then try again.'
+  -1 = 'Cancelled.'
 }
 function Show-Row($r) {
   $look = Get-StatusLook $r.Status
@@ -505,8 +534,9 @@ function Show-Row($r) {
   if ($r.Status -eq 'present' -and $isFile) {
     $ans = [System.Windows.Forms.MessageBox]::Show("$($r.Detail)`n`nStatus: $($look[0])`n`nQuarantine it now?`nThe file is moved to SimpleAV's quarantine and renamed so it can never run. You can restore it later.`n`nYes = Quarantine     No = Show in Explorer     Cancel = Close", 'SimpleAV', 'YesNoCancel', 'Warning')
     if ($ans -eq 'Yes') {
-      if (Invoke-EngineAction 'Quarantine' $r.Path) { [System.Windows.Forms.MessageBox]::Show("Quarantined:`n$($r.Path)", 'SimpleAV', 'OK', 'Information') | Out-Null }
-      else { [System.Windows.Forms.MessageBox]::Show("Could not quarantine the file. It may be in use - close the program using it, or restart, then try again.", 'SimpleAV', 'OK', 'Error') | Out-Null }
+      $code = Invoke-EngineAction 'Quarantine' $r.Path
+      if ($code -eq 0) { [System.Windows.Forms.MessageBox]::Show("Quarantined:`n$($r.Path)", 'SimpleAV', 'OK', 'Information') | Out-Null }
+      else { [System.Windows.Forms.MessageBox]::Show("Could not quarantine the file.`n`n$($ActionErrors[[int]$code])", 'SimpleAV', 'OK', 'Error') | Out-Null }
       $script:RowsKey = ''; Refresh-All
     } elseif ($ans -eq 'No') { Start-Process explorer.exe -ArgumentList "/select,`"$($r.Path)`"" }
     return
@@ -515,14 +545,15 @@ function Show-Row($r) {
   if ($r.Status -eq 'quarantined' -and $r.Q) {
     $ans = [System.Windows.Forms.MessageBox]::Show("$($r.Detail)`n`nStatus: Quarantined - locked away in:`n$($r.Q)`n`nIt can't run there. Nothing to do.`n`nRestore it to its original place? Only do this if you are SURE it is safe.", 'SimpleAV', 'YesNo', 'Information', 'Button2')
     if ($ans -eq 'Yes') {
-      if (Invoke-EngineAction 'Restore' $r.Q) { [System.Windows.Forms.MessageBox]::Show("Restored to:`n$($r.Path)", 'SimpleAV', 'OK', 'Information') | Out-Null }
-      else { [System.Windows.Forms.MessageBox]::Show('Could not restore the file.', 'SimpleAV', 'OK', 'Error') | Out-Null }
+      $code = Invoke-EngineAction 'Restore' $r.Q
+      if ($code -eq 0) { [System.Windows.Forms.MessageBox]::Show("Restored to:`n$($r.Path)", 'SimpleAV', 'OK', 'Information') | Out-Null }
+      else { [System.Windows.Forms.MessageBox]::Show("Could not restore the file.`n`n$($ActionErrors[[int]$code])", 'SimpleAV', 'OK', 'Error') | Out-Null }
       $script:RowsKey = ''; Refresh-All
     }
     return
   }
   $what = switch ($r.Status) {
-    'present'     { 'It is STILL on your PC. Check the details, then fix it (see the README) and run a new scan.' }
+    'present'     { "It is STILL on your PC. Check the details, then remove it (step-by-step: README, section 'If SimpleAV finds something') and run a new scan." }
     'running'     { 'It is RUNNING right now. Restart your PC, then run a scan.' }
     'quarantined' { 'It was moved into quarantine and renamed so it can never run. Nothing to do.' }
     'deleted'     { 'It was deleted from your PC. Nothing to do.' }
@@ -585,13 +616,19 @@ function Refresh-Progress {
     Set-Pill $btnScan 'Scan now' $C.Blue $C.BlueHover $true
     $lblProg.Text = ''
     if ($script:WasScanning) {
-      Refresh-All
-      $s = Get-LastScan
-      if ($s) {
-        $icon = if ($s.High) { 'Warning' } else { 'Information' }
-        $cov = if ($null -ne $s.Skipped) { "`nFolders that couldn't be read: $($s.Skipped)" } else { '' }
-        [System.Windows.Forms.MessageBox]::Show(("Scan finished: {0}`n`nPrograms checked: {1:N0}`nHigh-risk found: {2}`nMedium-risk found: {3}{4}`n`nAnything found is listed in Threat history." -f $s.Mode, $s.Files, $s.High, $s.Med, $cov), 'SimpleAV', 'OK', $icon) | Out-Null
-      }
+      # Reset BEFORE the dialog: the 1 s timer keeps ticking inside a modal message loop, and would
+      # otherwise see WasScanning = true again and stack one "Scan finished" dialog per second.
+      $script:WasScanning = $false
+      $script:Busy = $true
+      try {
+        Refresh-All
+        $s = Get-LastScan
+        if ($s) {
+          $icon = if ($s.High) { 'Warning' } else { 'Information' }
+          $cov = if ($null -ne $s.Skipped) { "`nFolders that couldn't be read: $($s.Skipped)" } else { '' }
+          [System.Windows.Forms.MessageBox]::Show(("Scan finished: {0}`n`nPrograms checked: {1:N0}`nHigh-risk found: {2}`nMedium-risk found: {3}{4}`n`nAnything found is listed in Threat history." -f $s.Mode, $s.Files, $s.High, $s.Med, $cov), 'SimpleAV', 'OK', $icon) | Out-Null
+        }
+      } finally { $script:Busy = $false }
     }
   }
   $script:WasScanning = $running
@@ -607,6 +644,7 @@ function Start-Scan([string]$flags, [string]$name) {
 }
 function Stop-Scan {
   if ([System.Windows.Forms.MessageBox]::Show('Stop the scan that is running?', 'SimpleAV', 'YesNo', 'Question') -ne 'Yes') { return }
+  if (-not (Test-ScanRunning)) { Refresh-Progress; return }   # it finished while the question was open
   $p = Get-Progress; if ($p -and $p.pid) { Stop-Process -Id $p.pid -Force }
   Get-EngineProcs '-(Scan|Quick|Deep)' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
   $script:Launched = [datetime]::MinValue; Remove-Item $ProgFile -Force; $script:WasScanning = $false
@@ -660,7 +698,9 @@ Anything else is only reported - click it in Threat history to quarantine or res
 
 # ================================================================== timers
 $timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 1000
-$timer.Add_Tick({ $script:Tick++; Refresh-Progress; if (($script:Tick % 15) -eq 0 -and -not $script:WasScanning) { Refresh-All } })
+# Skip ticks while a dialog is open: a message box disables the window (CanFocus = false), and refreshing
+# underneath it would rebuild the rows or open a second dialog on top.
+$timer.Add_Tick({ if ($script:Busy -or -not $form.CanFocus) { return }; $script:Tick++; Refresh-Progress; if (($script:Tick % 15) -eq 0 -and -not $script:WasScanning) { Refresh-All } })
 $anim = New-Object System.Windows.Forms.Timer; $anim.Interval = 40
 $anim.Add_Tick({ if ($hero.Tag.State -eq 'scan') { $script:Anim++; $hero.Invalidate() } })
 

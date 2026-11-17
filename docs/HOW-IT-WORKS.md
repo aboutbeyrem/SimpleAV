@@ -3,7 +3,7 @@
 This document describes the real infection that SimpleAV was written to detect, how it was
 analysed, and how each detection in SimpleAV maps to a technique the malware used.
 
-> All findings below come from my own PC (Windows 10, November 2026): Malwarebytes scan
+> All findings below come from my own PC (Windows 10, infected in June 2026, analysed in November 2026): Malwarebytes scan
 > results, the registry, scheduled tasks, the Windows Installer database, and byte-level
 > inspection of infected program files.
 
@@ -22,7 +22,7 @@ The infection had several cooperating parts.
 
 ### 2.1 A loader installed as fake drivers (PavinLoader)
 
-Two Windows Installer packages were installed from `%TEMP%` on 14 Oct 2026, pretending to be hardware software:
+Two Windows Installer packages were installed from `%TEMP%` in July 2026, pretending to be hardware software:
 
 | Display name | Claimed publisher |
 |---|---|
@@ -107,6 +107,21 @@ Real-time, the watcher re-checks new and changed program files within seconds, i
    (afterwards no process had it loaded), and it did not come back.
 6. After a reboot: no launchers, no payload, no fake DLL, no hidden PowerShell running, and quick/full re-scans were clean.
    Reinstalled apps (e.g. Discord) were verified as clean: valid signatures and no virus code.
+
+### Reinfection (16-17 November 2026)
+
+7. The infection came back. SimpleAV auto-quarantined **18 newly infected programs** by their exact 12-byte marker:
+   Discord, Claude Code, an installer in `Downloads`, two `%TEMP%\tx_*.exe` drops, and programs under an old Windows
+   profile on a second drive (`J:\Users\...`).
+8. The dashboard showed all four registry hooks (`UserCache`, `UserInitMprLogonScript`, HKCU Winlogon `Shell`, the
+   fake CLSID, whose registry export alone was ~278 KB) and the unsigned 56 KB `C:\Windows\omadmapi.dll` back in place.
+9. The hooks were exported to quarantine (renamed so they can't be re-imported by double-click), then removed:
+   **launchers first, payload second**, so nothing could rebuild it in between. They stayed gone on re-check, and no
+   payload process was running. The DLL was quarantined through SimpleAV with one admin prompt (SHA-256
+   `D2797D9AAB9ED671B07CC4BDA0CCF3D5837AECE3BCD38B2BE42D6B84607041A1`).
+10. **Open question:** what re-installs it. The infected programs on the old profile on the second drive are the main
+    suspect. Two returns after cleanup means the dependable fix is a clean Windows reinstall, copying back documents
+    only (never programs or installers).
 
 ## 5. Design decisions
 

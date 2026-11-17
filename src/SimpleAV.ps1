@@ -43,7 +43,7 @@
 
 .NOTES
   Author : Beyrem
-  Version: 1.2.0
+  Version: 1.3.0
   License: MIT
   Data   : %USERPROFILE%\SimpleAV  (override with the SIMPLEAV_HOME environment variable)
 #>
@@ -55,13 +55,23 @@ param(
 if ($Deep) { $Scan = $true; $AllDrives = $true }
 
 $ErrorActionPreference = 'SilentlyContinue'
-$Version = '1.2.0'
+# Byte-level PE inspection (exact 12-byte signature + structural check) and the version number live in one
+# shared file, also used by the dashboard. See SimpleAV.Detection.ps1.
+. (Join-Path $PSScriptRoot 'SimpleAV.Detection.ps1')
+$Version = $SAV_Version   # defined in SimpleAV.Detection.ps1
 # Lives in the user profile, NOT under AppData: some sandboxed apps redirect AppData writes.
 $AppDir  = if ($env:SIMPLEAV_HOME) { $env:SIMPLEAV_HOME } else { Join-Path $env:USERPROFILE 'SimpleAV' }
 $LogDir  = Join-Path $AppDir 'logs'
 $QDir    = Join-Path $AppDir 'quarantine'
 $ProgFile     = Join-Path $AppDir 'progress.json'
 $SettingsFile = Join-Path $AppDir 'settings.json'
+$SigCacheFile = Join-Path $AppDir 'sigcache.tsv'
+# Exact-prefix match for SimpleAV's own folder. A -like "$AppDir*" wildcard would also skip "SimpleAVUpdate\",
+# and breaks on paths that contain [ or ].
+$AppPrefix = $AppDir.TrimEnd('\') + '\'
+function Test-InAppDir([string]$p) { return ($p.Equals($AppDir.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) -or $p.StartsWith($AppPrefix, [StringComparison]::OrdinalIgnoreCase)) }
+# Matches only SimpleAV's own installed scripts, so malware can't hide by putting "SimpleAV.ps1" in its command line.
+$SelfCmdRx = '(?i)-File\s+"?(' + [regex]::Escape((Join-Path $AppDir 'SimpleAV')) + '|' + [regex]::Escape((Join-Path $PSScriptRoot 'SimpleAV')) + ')(-App)?\.ps1"?(\s|$)'
 $null = New-Item -ItemType Directory -Force -Path $LogDir
 
 $script:Findings    = New-Object System.Collections.Generic.List[object]
@@ -75,9 +85,6 @@ $script:ScanMode    = ''
 $script:ScanStart   = ''
 
 # ================================================================== detection data
-# First 12 bytes of the infector's code, found at the entry point of every infected file analysed.
-$KnownStub   = [byte[]](0xE8,0xD9,0x00,0x00,0x00,0x48,0x8D,0x58,0xFB,0x51,0x52,0x41)
-$KnownPrefix = 'known virus code'
 # Placeholder-looking CLSID the loader used to store its payload in the registry.
 $FakeClsid = '{A1B2C3D4-E5F6-7890-1234-567890ABCDEF}'
 # Command lines typical of this kind of malware (hidden encoded PowerShell, script hosts, MSBuild abuse...).
@@ -146,52 +153,12 @@ function Show-Alert([string]$title, [string]$text, [string]$level = 'Warning') {
 }
 
 # ================================================================== file checks
-<# Returns $null if clean, otherwise a reason. Sets $script:LastWasPE when the file really is a Windows program.
-   Two detections:
-     1) EXACT: the infector's 12-byte code sits at the program's entry point.
-     2) HEURISTIC: the entry point was moved into the last section, which is a data section
-        (.reloc/.rsrc/...) marked writable + executable - how this family of infectors patches programs. #>
+# Returns $null if clean, otherwise a reason. Sets $script:LastWasPE when the file really is a Windows program.
 function Test-PEInfected([string]$path) {
-  $script:LastWasPE = $false
-  $fs = $null
-  try {
-    $fs  = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite, Delete')
-    $buf = New-Object byte[] 4096
-    $n   = $fs.Read($buf, 0, 4096)
-    if ($n -lt 64 -or $buf[0] -ne 0x4D -or $buf[1] -ne 0x5A) { return $null }      # 'MZ'
-    $pe = [BitConverter]::ToInt32($buf, 0x3C)
-    if ($pe -lt 0 -or ($pe + 64) -gt $n) { return $null }
-    if ([BitConverter]::ToUInt32($buf, $pe) -ne 17744) { return $null }            # 'PE\0\0'
-    $script:LastWasPE = $true
-    $nsec  = [BitConverter]::ToUInt16($buf, $pe + 6)
-    $optsz = [BitConverter]::ToUInt16($buf, $pe + 20)
-    $ep    = [int64][BitConverter]::ToUInt32($buf, $pe + 40)
-    $so    = $pe + 24 + $optsz
-    if ($nsec -eq 0 -or $ep -eq 0 -or ($so + $nsec * 40) -gt $n) { return $null }
-    $epIdx = -1; $epName = ''; $epVA = 0; $epRP = 0; $epCh = 0
-    for ($i = 0; $i -lt $nsec; $i++) {
-      $b  = $so + $i * 40
-      $vs = [int64][BitConverter]::ToUInt32($buf, $b + 8)
-      $va = [int64][BitConverter]::ToUInt32($buf, $b + 12)
-      $rs = [int64][BitConverter]::ToUInt32($buf, $b + 16)
-      $rp = [int64][BitConverter]::ToUInt32($buf, $b + 20)
-      $ch = [int64][BitConverter]::ToUInt32($buf, $b + 36)
-      if ($ep -ge $va -and $ep -lt ($va + [Math]::Max($vs, $rs))) {
-        $epIdx = $i; $epVA = $va; $epRP = $rp; $epCh = $ch
-        $epName = [Text.Encoding]::ASCII.GetString($buf, $b, 8).TrimEnd([char]0)
-      }
-    }
-    if ($epIdx -lt 0) { return $null }
-    $off  = $epRP + ($ep - $epVA)
-    $stub = New-Object byte[] 12
-    if ($off -ge 0 -and ($off + 12) -le $fs.Length) { $null = $fs.Seek($off, 'Begin'); $null = $fs.Read($stub, 0, 12) }
-    $same = $true; for ($k = 0; $k -lt 12; $k++) { if ($stub[$k] -ne $KnownStub[$k]) { $same = $false; break } }
-    if ($same) { return "$KnownPrefix at entry point (section $epName)" }
-    $rwx = (($epCh -band 3758096384) -eq 3758096384)                                 # 0xE0000000 = execute+read+write
-    $dataSec = @('.reloc', '.rsrc', '.data', '.pdata', '.idata', '.tls', '.rdata') -contains $epName
-    if ($epIdx -eq ($nsec - 1) -and $dataSec -and $rwx) { return "entry point moved into writable+executable '$epName' section (file-infector pattern)" }
-    return $null
-  } catch { $script:Unreadable++; return $null } finally { if ($fs) { $fs.Dispose() } }
+  $v = Get-PEVerdict $path
+  $script:LastWasPE = $v.IsPE
+  if ($v.Unreadable) { $script:Unreadable++ }
+  return $v.Reason
 }
 
 # Walks a folder tree without following junctions; yields program files (or every file with -Deep).
@@ -203,7 +170,7 @@ function Get-ScanFiles([string]$root) {
     try {
       foreach ($sub in [System.IO.Directory]::GetDirectories($d)) {
         if ($SkipDirNames -contains [System.IO.Path]::GetFileName($sub)) { continue }
-        if ($sub -like "$AppDir*") { continue }
+        if (Test-InAppDir $sub) { continue }
         if (([System.IO.File]::GetAttributes($sub) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
         $stack.Push($sub)
       }
@@ -222,26 +189,65 @@ function Add-Skipped([string]$dir, $err) {
     $script:SkippedList.Add("$dir  ($why)")
   }
 }
+# selfhash.txt holds one "file|SHA256" line per installed script (a bare hash = SimpleAV.ps1, from 1.2.0).
+$SelfFiles = 'SimpleAV.ps1', 'SimpleAV.Detection.ps1', 'SimpleAV-App.ps1'
 function Test-SelfIntegrity {
   $hashFile = Join-Path $AppDir 'selfhash.txt'
-  $installed = Join-Path $AppDir 'SimpleAV.ps1'
-  if ((Test-Path $hashFile) -and (Test-Path $installed)) {
-    $want = (Get-Content $hashFile -TotalCount 1).Trim()
-    $have = (Get-FileHash $installed -Algorithm SHA256).Hash
-    if ($want -ne $have) { $null = Add-Finding 'HIGH' 'SIMPLEAV MODIFIED' $installed 'SimpleAV itself was changed after install - something may be tampering with it' }
+  if (-not (Test-Path $hashFile)) { return }
+  foreach ($line in Get-Content $hashFile) {
+    $parts = $line.Trim().Split('|')
+    if ($parts.Count -eq 2) { $name = $parts[0]; $want = $parts[1] } elseif ($parts[0]) { $name = 'SimpleAV.ps1'; $want = $parts[0] } else { continue }
+    $file = Join-Path $AppDir $name
+    $have = if (Test-Path -LiteralPath $file) { (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash } else { 'missing' }
+    if ($want -ne $have) { $null = Add-Finding 'HIGH' 'SIMPLEAV MODIFIED' $file 'SimpleAV itself was changed after install - something may be tampering with it' }
   }
+}
+
+# Authenticode checks are the slowest part of a scan. Results are cached by path + size + last-write time,
+# so an unchanged file is never re-verified; any modification changes the key and forces a fresh check.
+$script:SigCache = $null; $script:SigCacheHits = 0
+function Get-SigStatus([string]$f) {
+  if ($null -eq $script:SigCache) {
+    $script:SigCache = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    if (Test-Path $SigCacheFile) { foreach ($l in [System.IO.File]::ReadAllLines($SigCacheFile)) { $t = $l.LastIndexOf("`t"); if ($t -gt 0) { $script:SigCache[$l.Substring(0, $t)] = $l.Substring($t + 1) } } }
+  }
+  $key = $f
+  try { $fi = New-Object System.IO.FileInfo $f; $key = '{0}|{1}|{2}' -f $f, $fi.Length, $fi.LastWriteTimeUtc.Ticks } catch {}
+  $script:SigUsed[$f] = $key
+  $st = $null
+  if ($script:SigCache.TryGetValue($key, [ref]$st)) { $script:SigCacheHits++; return $st }
+  $st = [string](Get-AuthenticodeSignature -LiteralPath $f).Status
+  if ($st -and $st -ne 'UnknownError') { $script:SigCache[$key] = $st }       # don't cache transient failures
+  return $st
+}
+$script:SigUsed = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+# Keeps the current entry for every file checked this scan, plus older entries for files this scan didn't
+# visit (a Quick scan must not throw away the cache for Program Files). Entries for deleted files are dropped.
+function Save-SigCache {
+  if ($null -eq $script:SigCache) { return }
+  $lines = New-Object System.Collections.Generic.List[string]
+  foreach ($kv in $script:SigCache.GetEnumerator()) {
+    $path = $kv.Key.Split('|')[0]; $used = $null
+    if ($script:SigUsed.TryGetValue($path, [ref]$used)) { if ($used -ne $kv.Key) { continue } }
+    elseif (-not [System.IO.File]::Exists($path)) { continue }
+    $lines.Add("$($kv.Key)`t$($kv.Value)")
+  }
+  try { [System.IO.File]::WriteAllLines($SigCacheFile, $lines.ToArray()) } catch {}
 }
 
 # ================================================================== quarantine
 <# Moves a file into the quarantine folder, renamed to *.quarantined so it can never run, and writes a
-   small .txt record (original path, hash, reason). Returns 'ok', 'missing' or 'denied'. #>
+   small .txt record (original path, hash, reason). Returns 'ok', 'missing' or 'denied'.
+   Only single files are accepted: a folder path is treated as 'missing', never moved wholesale. #>
 function Move-ToQuarantine([string]$path, [string]$reason) {
-  if (-not (Test-Path -LiteralPath $path)) { return 'missing' }
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return 'missing' }
   $null = New-Item -ItemType Directory -Force -Path $QDir
   $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
   $dest = Join-Path $QDir ('{0}_{1}.quarantined' -f [System.IO.Path]::GetFileName($path), (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
   try { Move-Item -LiteralPath $path -Destination $dest -Force -ErrorAction Stop }
-  catch { return 'denied' }
+  catch {   # 'denied' = admin rights could help; 'inuse' = they wouldn't (the file is locked by a running program)
+    if ($_.Exception -is [System.UnauthorizedAccessException] -or $_.CategoryInfo.Category -eq 'PermissionDenied' -or ($_.Exception.HResult -band 0xFFFF) -eq 5) { return 'denied' } else { return 'inuse' }
+  }
   @("Original path: $path", "SHA256: $hash", "Quarantined: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')", "Reason: $reason") | Set-Content -Path ($dest + '.txt') -Encoding UTF8
   return 'ok'
 }
@@ -249,26 +255,41 @@ function Invoke-QuarantineCmd([string]$path) {
   Start-Log 'quarantine'
   $r = Move-ToQuarantine $path 'quarantined by user'
   Write-Log "QUARANTINE $path -> $r"
-  if ($r -eq 'denied') { exit 5 } elseif ($r -eq 'missing') { exit 2 } else { exit 0 }
+  switch ($r) { 'ok' { exit 0 } 'missing' { exit 2 } 'denied' { exit 5 } default { exit 6 } }
 }
+<# Exit codes: 0 restored | 2 not a quarantined file | 3 record invalid or file doesn't match its recorded hash
+   4 something already exists at the original path (never overwritten) | 5 Windows denied access (admin needed) | 6 other error #>
 function Invoke-RestoreCmd([string]$qfile) {
   Start-Log 'restore'
   $rec = "$qfile.txt"
-  if (-not (Test-Path -LiteralPath $qfile) -or -not (Test-Path -LiteralPath $rec)) { Write-Log "RESTORE failed: not a quarantined file: $qfile"; exit 2 }
-  $orig = (Get-Content $rec | Where-Object { $_ -like 'Original path:*' } | Select-Object -First 1) -replace '^Original path:\s*', ''
+  if (-not (Test-Path -LiteralPath $qfile -PathType Leaf) -or -not (Test-Path -LiteralPath $rec)) { Write-Log "RESTORE failed: not a quarantined file: $qfile"; exit 2 }
+  $lines = Get-Content -LiteralPath $rec
+  $orig = ($lines | Where-Object { $_ -like 'Original path:*' } | Select-Object -First 1) -replace '^Original path:\s*', ''
+  $want = ($lines | Where-Object { $_ -like 'SHA256:*' } | Select-Object -First 1) -replace '^SHA256:\s*', ''
+  # The record sits in a user-writable folder, so treat it as untrusted input.
+  if (-not $orig -or $orig -notmatch '^[A-Za-z]:\\' -or $orig.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0 -or $orig -match '[\*\?]') {
+    Write-Log "RESTORE refused: invalid original path in record: '$orig'"; exit 3
+  }
+  if ($want -and (Get-FileHash -LiteralPath $qfile -Algorithm SHA256).Hash -ne $want.Trim()) {
+    Write-Log "RESTORE refused: $qfile does not match the SHA-256 recorded at quarantine time"; exit 3
+  }
+  if (Test-Path -LiteralPath $orig) { Write-Log "RESTORE refused: $orig already exists (e.g. a clean reinstall) - not overwriting it"; exit 4 }
   try {
-    $null = New-Item -ItemType Directory -Force -Path (Split-Path $orig)
-    Move-Item -LiteralPath $qfile -Destination $orig -Force -ErrorAction Stop
+    $null = New-Item -ItemType Directory -Force -Path (Split-Path $orig) -ErrorAction Stop
+    Move-Item -LiteralPath $qfile -Destination $orig -ErrorAction Stop
     Remove-Item -LiteralPath $rec -Force
     Write-Log "RESTORED $qfile -> $orig"; exit 0
-  } catch { Write-Log "RESTORE denied: $orig ($($_.Exception.Message))"; exit 5 }
+  } catch {
+    Write-Log "RESTORE failed: $orig ($($_.Exception.Message))"
+    if ($_.Exception -is [System.UnauthorizedAccessException] -or $_.CategoryInfo.Category -eq 'PermissionDenied' -or ($_.Exception.HResult -band 0xFFFF) -eq 5) { exit 5 } else { exit 6 }
+  }
 }
 # Called on every infected file: quarantines EXACT matches automatically (if enabled), reports the rest.
 function Handle-Infected([string]$path, [string]$why, [string]$kind) {
   if ($AutoQ -and $why.StartsWith($KnownPrefix)) {
     $r = Move-ToQuarantine $path "auto: $why"
     if ($r -eq 'ok') { return (Add-Finding 'HIGH' 'AUTO-QUARANTINED' $path "$why - moved to quarantine automatically") }
-    return (Add-Finding 'HIGH' $kind $path "$why (auto-quarantine failed: $r - needs admin rights)")
+    return (Add-Finding 'HIGH' $kind $path "$why (auto-quarantine failed: $(if ($r -eq 'inuse') { 'file is in use' } else { 'needs admin rights' }))")
   }
   return (Add-Finding 'HIGH' $kind $path $why)
 }
@@ -324,21 +345,33 @@ function Test-PersistenceItem([string]$key, [string]$val) {
       return @('LOW', 'IFEO debugger set (often a "disable Windows Update" tweak)')
     }
     default {
-      if ($val -match $BadCmd -and $val -notmatch 'SimpleAV\.ps1') { return @('HIGH', 'startup entry runs a suspicious command') }
+      if ($val -match $BadCmd -and $val -notmatch $SelfCmdRx) { return @('HIGH', 'startup entry runs a suspicious command') }
       if ($parts[0] -eq 'RUN' -and $val -match '(?i)\\appdata\\local\\temp\\') { return @('MEDIUM', 'startup entry runs from the Temp folder') }
       return $null
     }
   }
 }
-function Invoke-PersistenceCheck {
+# Copies of MSBuild.exe in user folders (the loader ran its payload through one).
+$MsbuildDirs  = @($env:USERPROFILE, $env:ProgramData, $env:PUBLIC) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') + '\' }
+$MsbuildAllow = '(?i)Microsoft Visual Studio|\\dotnet\\|BuildTools|\\\.nuget\\|\\sdk\\'
+function Test-MsbuildCopy([string]$f) {
+  if (-not $f.EndsWith('\msbuild.exe', [StringComparison]::OrdinalIgnoreCase) -or $f -match $MsbuildAllow) { return }
+  foreach ($d in $MsbuildDirs) {
+    if ($f.StartsWith($d, [StringComparison]::OrdinalIgnoreCase)) { $null = Add-Finding 'HIGH' 'MSBUILD COPY' $f 'MSBuild.exe copied into a user folder - a known trick to run hidden code'; return }
+  }
+}
+function Test-Covered([string]$dir, $roots) {
+  foreach ($r in $roots) { $rr = $r.TrimEnd('\') + '\'; if (($dir.TrimEnd('\') + '\').StartsWith($rr, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+  return $false
+}
+function Invoke-PersistenceCheck($roots) {
   Write-Log '--- Checking startup / persistence locations'
   $snap = Get-PersistenceSnapshot
   foreach ($k in $snap.Keys) { $r = Test-PersistenceItem $k $snap[$k]; if ($r) { $null = Add-Finding $r[0] 'STARTUP/PERSISTENCE' $k ("{0} | value: {1}" -f $r[1], $snap[$k]) } }
-  # Copies of MSBuild.exe outside normal locations (the loader ran its payload through one)
-  foreach ($root in $env:USERPROFILE, $env:ProgramData, $env:PUBLIC) {
-    Get-ChildItem $root -Recurse -Force -File -Filter 'msbuild.exe' |
-      Where-Object { $_.FullName -notmatch '(?i)Microsoft Visual Studio|\\dotnet\\|BuildTools|\\\.nuget\\|\\sdk\\' } |
-      ForEach-Object { $null = Add-Finding 'HIGH' 'MSBUILD COPY' $_.FullName 'MSBuild.exe copied into a user folder - a known trick to run hidden code' }
+  # MSBuild copies: folders the main walk will visit anyway are checked there, so they aren't walked twice.
+  foreach ($d in $MsbuildDirs) {
+    if (Test-Covered $d $roots) { continue }
+    foreach ($f in Get-ScanFiles $d) { Test-MsbuildCopy $f }
   }
 }
 
@@ -350,14 +383,14 @@ function Invoke-Scan {
   $script:ScanMode = if ($Paths) { 'Custom' } elseif ($Deep) { 'Deep (every file)' } elseif ($Quick) { 'Quick' } elseif ($AllDrives) { 'All drives' } else { 'Full (C:)' }
   Write-Log "Mode: $($script:ScanMode)"
   Write-Log "Auto-quarantine of exact virus matches: $(if ($AutoQ) { 'ON' } else { 'OFF' })"
-  Set-Progress 'running' 'Checking startup entries' 0
-  Test-SelfIntegrity
-  if (-not $SkipSystem) { Invoke-PersistenceCheck }
-
   if ($Paths) { $roots = $Paths }
   elseif ($Quick) { $roots = @($env:USERPROFILE) }
   elseif ($AllDrives) { $roots = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } | ForEach-Object { $_.RootDirectory.FullName } }
   else { $roots = @("$env:SystemDrive\") }
+
+  Set-Progress 'running' 'Checking startup entries' 0
+  Test-SelfIntegrity
+  if (-not $SkipSystem) { Invoke-PersistenceCheck $roots }
 
   # 1) Windows system files: signatures + DLL hijacks next to explorer.exe
   $sysCount = 0
@@ -377,10 +410,10 @@ function Invoke-Scan {
         if (-not ($PEExt -contains [System.IO.Path]::GetExtension($f).ToLowerInvariant())) { continue }
         $sysCount++
         if (($sysCount % 250) -eq 0) { Set-Progress 'running' "Checking Windows system files ($sysCount)" 0 }
-        $s = Get-AuthenticodeSignature -LiteralPath $f
+        $st = Get-SigStatus $f
         $name = [System.IO.Path]::GetFileName($f).ToLowerInvariant()
-        if ($s.Status -eq 'HashMismatch') { $null = Add-Finding 'HIGH' 'TAMPERED SYSTEM FILE' $f 'signature broken - file was modified after Microsoft signed it' }
-        elseif ($s.Status -ne 'Valid') {
+        if ($st -eq 'HashMismatch') { $null = Add-Finding 'HIGH' 'TAMPERED SYSTEM FILE' $f 'signature broken - file was modified after Microsoft signed it' }
+        elseif ($st -ne 'Valid') {
           if ($d -eq $env:SystemRoot -and $sys32Names.ContainsKey($name)) {
             $null = Add-Finding 'HIGH' 'DLL HIJACK' $f 'unsigned copy of a System32 file placed next to explorer.exe - Explorer loads it instead of the real one'
           } else {
@@ -409,6 +442,7 @@ function Invoke-Scan {
       if (-not $script:LastWasPE) { continue }          # not a program (only possible with -Deep)
       $progCount++
       if ($why) { $null = Handle-Infected $f $why 'INFECTED FILE'; continue }
+      if (-not $SkipSystem) { Test-MsbuildCopy $f }
       $ext = [System.IO.Path]::GetExtension($f).ToLowerInvariant()
       if (-not ($PEExt -contains $ext)) {
         if ($DisguiseExt -contains $ext) { $null = Add-Finding 'HIGH' 'DISGUISED PROGRAM' $f "a real Windows program pretending to be a '$ext' file" }
@@ -418,7 +452,7 @@ function Invoke-Scan {
       if (-not $doSig) { foreach ($sr in $sigRoots) { if ($sr -and $f.StartsWith($sr + '\', [StringComparison]::OrdinalIgnoreCase)) { $doSig = $true; break } } }
       if ($doSig) {
         $sigCount++
-        if ((Get-AuthenticodeSignature -LiteralPath $f).Status -eq 'HashMismatch') { $null = Add-Finding 'HIGH' 'TAMPERED FILE' $f 'signature broken - file was modified after it was signed' }
+        if ((Get-SigStatus $f) -eq 'HashMismatch') { $null = Add-Finding 'HIGH' 'TAMPERED FILE' $f 'signature broken - file was modified after it was signed' }
       }
     }
   }
@@ -434,7 +468,10 @@ function Invoke-Scan {
     Write-Log "Folders SimpleAV could not read (Windows blocks normal apps from these; first $($script:SkippedList.Count) shown):"
     foreach ($s in $script:SkippedList) { Write-Log "    SKIPPED $s" }
   }
-  Write-Log ("=== DONE in {0:N0} min. Program files checked: {1:N0} (signatures: {2:N0} + {3:N0} system). Findings: HIGH={4} MEDIUM={5} LOW={6} AUTOQ={7}" -f $dur.TotalMinutes, $progCount, $sigCount, $sysCount, $high, $med, $low, $auto)
+  Save-SigCache
+  Write-Log ("    signature cache: {0} of {1} checks reused from earlier scans" -f $script:SigCacheHits, ($sigCount + $sysCount))
+  # Invariant culture: this line is parsed by the dashboard, and e.g. fr-FR would write "54 509" with a no-break space.
+  Write-Log ([string]::Format([cultureinfo]::InvariantCulture, "=== DONE in {0:N0} min. Program files checked: {1:N0} (signatures: {2:N0} + {3:N0} system). Findings: HIGH={4} MEDIUM={5} LOW={6} AUTOQ={7}", $dur.TotalMinutes, $progCount, $sigCount, $sysCount, $high, $med, $low, $auto))
   if ($script:Findings.Count) { $script:Findings | Export-Csv -Path ($script:LogFile -replace '\.log$', '.csv') -NoTypeInformation -Encoding UTF8 }
   Set-Progress 'done' 'Finished' $count
   if ($high -gt 0)    { Show-Alert 'SimpleAV: threats found' "$high high-risk item(s) ($auto quarantined automatically), $med medium. Open SimpleAV for details." 'Error' }
@@ -444,8 +481,13 @@ function Invoke-Scan {
 
 # ================================================================== real-time watcher
 function Invoke-Watch {
-  $me = Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.Name -match '^(powershell|pwsh)\.exe$' -and $_.CommandLine -match '-File\s+"?[^"]*SimpleAV\.ps1"?\s+-Watch' }
-  if ($me) { Write-Host 'SimpleAV watcher already running.'; return }
+  # One watcher per data folder: a named mutex (released automatically if the process dies).
+  $sha = New-Object System.Security.Cryptography.SHA256Managed
+  $tag = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($AppDir.ToLowerInvariant()))) -replace '-', '').Substring(0, 16)
+  $script:WatchMutex = New-Object System.Threading.Mutex($false, "Local\SimpleAV-Watch-$tag")
+  $owned = $false
+  try { $owned = $script:WatchMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+  if (-not $owned) { Write-Host 'SimpleAV watcher already running.'; return }
   Start-Log 'watch'
   Init-Tray
   Test-SelfIntegrity
@@ -463,20 +505,35 @@ function Invoke-Watch {
     $null = Register-ObjectEvent -InputObject $w -EventName Created -SourceIdentifier "SAV_C$i"
     $null = Register-ObjectEvent -InputObject $w -EventName Changed -SourceIdentifier "SAV_W$i"
     $null = Register-ObjectEvent -InputObject $w -EventName Renamed -SourceIdentifier "SAV_R$i"
+    # Raised when the 64 KB event buffer overflows (changes were lost) or the watched folder becomes unavailable.
+    $null = Register-ObjectEvent -InputObject $w -EventName Error -SourceIdentifier "SAV_E$i"
   }
 
-  $seenPids = @{}; foreach ($p in Get-Process) { $seenPids[$p.Id] = $true }
+  # Processes are keyed by ID + start time: Windows reuses IDs, so an ID alone could hide a new process.
+  $procKey = { param($p) '{0}|{1}' -f $p.ProcessId, $(if ($p.CreationDate) { $p.CreationDate.Ticks } else { 0 }) }
+  $seenProcs = @{}; foreach ($p in Get-CimInstance Win32_Process) { $seenProcs[(& $procKey $p)] = $true }
   $pending = @{}
+  $lastOverflowLog = [datetime]::MinValue
   $nextProc = Get-Date; $nextPersist = (Get-Date).AddSeconds(60); $nextHeartbeat = (Get-Date).AddHours(1)
 
   while ($true) {
     [System.Windows.Forms.Application]::DoEvents()
-    $ev = Wait-Event -Timeout 1
-    if ($ev) {
-      $path = $ev.SourceEventArgs.FullPath
-      Remove-Event -EventIdentifier $ev.EventIdentifier
-      if ($path -and ($PEExt -contains [System.IO.Path]::GetExtension($path).ToLowerInvariant()) -and $path -notlike "$AppDir*") { $pending[$path] = (Get-Date).AddSeconds(3) }
-      continue
+    # Drain every queued file event, then fall through: a burst (npm install, game update) must not
+    # starve the process and startup checks below.
+    if (Wait-Event -Timeout 1) {
+      foreach ($ev in @(Get-Event)) {
+        Remove-Event -EventIdentifier $ev.EventIdentifier
+        if ($ev.SourceIdentifier -like 'SAV_E*') {
+          try { $ev.Sender.EnableRaisingEvents = $true } catch {}
+          if (((Get-Date) - $lastOverflowLog).TotalMinutes -ge 1) {
+            $lastOverflowLog = Get-Date
+            Write-Log "WARNING file watcher on $($ev.Sender.Path): $($ev.SourceEventArgs.GetException().Message) - some file changes were missed; run a Quick scan to be sure"
+          }
+          continue
+        }
+        $path = $ev.SourceEventArgs.FullPath
+        if ($path -and ($PEExt -contains [System.IO.Path]::GetExtension($path).ToLowerInvariant()) -and -not (Test-InAppDir $path)) { $pending[$path] = (Get-Date).AddSeconds(3) }
+      }
     }
     $now = Get-Date
 
@@ -501,11 +558,13 @@ function Invoke-Watch {
     # New processes, every 15 s
     if ($now -ge $nextProc) {
       $nextProc = $now.AddSeconds(15)
+      $current = @{}
       foreach ($p in Get-CimInstance Win32_Process) {
-        if ($seenPids.ContainsKey([int]$p.ProcessId)) { continue }
-        $seenPids[[int]$p.ProcessId] = $true
+        $key = & $procKey $p
+        $current[$key] = $true
+        if ($seenProcs.ContainsKey($key)) { continue }
         $cmd = [string]$p.CommandLine; $exe = [string]$p.ExecutablePath
-        if ($cmd -match 'SimpleAV(-App)?\.ps1') { continue }
+        if ($p.Name -match '(?i)^(powershell|pwsh)\.exe$' -and $cmd -match $SelfCmdRx) { continue }
         if ($p.Name -match '(?i)^(powershell|pwsh|conhost|cmd|mshta|wscript|cscript|rundll32|regsvr32)\.exe$' -and $cmd -match $BadCmd) {
           $null = Add-Finding 'HIGH' 'SUSPICIOUS PROCESS' "$($p.Name) [$($p.ProcessId)]" $cmd
           Show-Alert 'SimpleAV: suspicious hidden command' "$($p.Name) ran a command that looks like malware. Open SimpleAV for details." 'Error'
@@ -518,6 +577,7 @@ function Invoke-Watch {
           elseif ($exe -match '(?i)\\appdata\\local\\temp\\') { $null = Add-Finding 'LOW' 'PROGRAM RAN FROM TEMP' $exe $cmd }
         }
       }
+      $seenProcs = $current          # forget processes that have exited, so the table never grows unbounded
     }
 
     # Startup entries added or changed, every 60 s
@@ -545,12 +605,14 @@ function Invoke-Watch {
 function Invoke-Install {
   $null = New-Item -ItemType Directory -Force -Path $AppDir
   $src = Split-Path -Parent $PSCommandPath
-  foreach ($f in 'SimpleAV.ps1', 'SimpleAV-App.ps1', 'SimpleAV.ico') {
+  $dest = Join-Path $AppDir 'SimpleAV.ps1'
+  # Stop a watcher from a previous install first, so the new version actually takes over.
+  Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.Name -match '^(powershell|pwsh)\.exe$' -and $_.CommandLine -like "*$dest*-Watch*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+  foreach ($f in $SelfFiles + 'SimpleAV.ico') {
     $from = Join-Path $src $f; $to = Join-Path $AppDir $f
     if ((Test-Path $from) -and ($from -ine $to)) { Copy-Item -LiteralPath $from -Destination $to -Force }
   }
-  $dest = Join-Path $AppDir 'SimpleAV.ps1'
-  (Get-FileHash $dest -Algorithm SHA256).Hash | Set-Content (Join-Path $AppDir 'selfhash.txt')
+  $SelfFiles | ForEach-Object { '{0}|{1}' -f $_, (Get-FileHash -LiteralPath (Join-Path $AppDir $_) -Algorithm SHA256).Hash } | Set-Content (Join-Path $AppDir 'selfhash.txt')
   $ps   = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
   $user = "$env:USERDOMAIN\$env:USERNAME"
   $set  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
@@ -593,6 +655,7 @@ function Invoke-Uninstall {
 }
 
 # ================================================================== main
+if ($MyInvocation.InvocationName -eq '.') { return }   # dot-sourced (tests): load the functions only
 if     ($Install)    { Invoke-Install }
 elseif ($Uninstall)  { Invoke-Uninstall }
 elseif ($Quarantine) { Invoke-QuarantineCmd $Quarantine }
