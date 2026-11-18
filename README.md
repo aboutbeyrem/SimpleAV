@@ -182,6 +182,9 @@ triggers an admin prompt.
   read, so nothing is skipped silently.
 - **No dependencies.** It's plain PowerShell 5.1 + .NET, both signed by Microsoft and on every Windows 10/11 PC. A
   tool that cleans an infected machine shouldn't depend on programs the infection may have modified.
+- **Why `-ExecutionPolicy Bypass`.** The scripts aren't code-signed, and Windows' execution policy is a guard against
+  running scripts by accident, not a security boundary (Microsoft says so itself). SimpleAV protects its own files
+  differently: it records their SHA-256 at install and warns if any of them changes.
 
 ---
 
@@ -275,6 +278,10 @@ SimpleAV is a focused tool, not a replacement for a full antivirus.
   the real fix is a clean Windows reinstall.
 - Quarantined files are renamed, not encrypted. They can't be opened by double-clicking, but a program that is
   pointed at the full path could still load one.
+- The first scan remembers every unsigned system file already present as "known". On a PC that is already infected,
+  read that first scan's log: anything malicious in that list won't be reported again.
+- The self-integrity hashes live in the same user folder as the scripts. They catch accidental or careless tampering,
+  but malware running as you could rewrite both.
 
 ## Project structure
 
@@ -292,9 +299,10 @@ docs/HOW-IT-WORKS.md          analysis of the infection and the detection logic
 
 ## Acknowledgements
 
-I built this with AI pair-programming assistance (Claude by Anthropic), which helped with the malware analysis,
-code and testing. The investigation, the decisions and the real-world cleanup were done on my own PC. The
-dashboard follows Apple's Human Interface Guidelines: one primary action, clear status, plain language.
+Much of the code and of the malware analysis was done with AI coding agents (Claude Code by Anthropic) under my
+direction; every commit says so. The infection, the investigation, the decisions and the real-world cleanup happened
+on my own PC. The dashboard follows Apple's Human Interface Guidelines: one primary action, clear status, plain
+language.
 
 ## License
 

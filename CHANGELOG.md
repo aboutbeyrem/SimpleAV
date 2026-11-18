@@ -1,5 +1,8 @@
 # Changelog
 
+Versions 1.0 to 1.2 were built and used locally on the infected PC; this repository starts at 1.2.0, published
+on 2026-11-17.
+
 ## 1.3.0 - 2026-11-17
 Hardening after a code review, and after the infection came back on the PC this tool was built for.
 - **Shared detection core** (`src/SimpleAV.Detection.ps1`): the scanner and the dashboard now use one PE parser
