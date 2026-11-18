@@ -32,10 +32,14 @@ re-created.
 
 ## The story
 
-In **June 2026** my PC got infected. Malwarebytes kept finding the same threats (`Spyware.DarkSide`,
-`Trojan.Crypt`, `RiskWare.MSBuild.Abused`), reported "removed", and after every reboot they were back.
+In **June 2026** a stranger who had hijacked a friend's Discord account sent me a file from it, and I ran it.
+I found **Blank Grabber**, an account stealer, wiped my system and cleaned up. What I didn't find was the second
+thing that came in with it: a file infector.
 
-Instead of wiping Windows, I took the infection apart: the registry, scheduled tasks, the Windows Installer
+It survived the cleanup. Malwarebytes kept finding the same threats (`Spyware.DarkSide`, `Trojan.Crypt`,
+`RiskWare.MSBuild.Abused`), reported "removed", and after every reboot they were back.
+
+This time, instead of wiping again, I took the infection apart: the registry, scheduled tasks, the Windows Installer
 database, and byte-level comparisons of infected vs. clean copies of the same programs. It turned out to be
 four parts working together:
 
@@ -299,9 +303,9 @@ docs/HOW-IT-WORKS.md          analysis of the infection and the detection logic
 
 ## Acknowledgements
 
-Much of the code and of the malware analysis was done with AI coding agents (Claude Code by Anthropic) under my
-direction; every commit says so. The infection, the investigation, the decisions and the real-world cleanup happened
-on my own PC. The dashboard follows Apple's Human Interface Guidelines: one primary action, clear status, plain
+The investigation, the design, the decisions and the real-world cleanup are mine, on my own infected PC. I built it
+with AI coding agents (Claude Code by Anthropic) as my tools for writing code and digging through evidence, and every
+commit says so. The dashboard follows Apple's Human Interface Guidelines: one primary action, clear status, plain
 language.
 
 ## License

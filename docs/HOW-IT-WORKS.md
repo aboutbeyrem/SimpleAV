@@ -75,7 +75,13 @@ between two observations about 20 minutes apart while it was loaded.
 ### 2.6 Payloads
 
 A crypto miner disguised as `.jpeg` files in `%APPDATA%\Microsoft`, and encrypted payload drops
-(`Trojan.Crypt`) in `%TEMP%`. The origin was most likely an untrusted download.
+(`Trojan.Crypt`) in `%TEMP%`.
+
+### 2.7 How it got in
+
+It arrived in the same attack as **Blank Grabber**, an account stealer: a file sent from a friend's hijacked Discord
+account. The stealer was found and removed first, together with a full wipe; this file infector was not, and it
+survived the cleanup.
 
 ## 3. Techniques (MITRE ATT&CK) and how SimpleAV detects them
 
