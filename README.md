@@ -14,7 +14,7 @@
 
 ![SimpleAV dashboard](docs/screenshot.png)
 
-<p align="center"><i>Made by Beyrem</i></p>
+<p align="center"><i>Made by <a href="https://www.aboutbeyrem.com">Beyrem Oueslati</a></i></p>
 
 **In 60 seconds:** my PC got a virus that patched **865 programs** and survived every antivirus "removal". I traced
 it to four cooperating parts, the worst being a fake `omadmapi.dll` that Windows Explorer loaded at every start.
